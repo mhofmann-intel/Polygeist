@@ -11,7 +11,10 @@
 //===----------------------------------------------------------------------===//
 #include "PassDetails.h"
 
-#include "mlir/../../lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp"
+// namespace mlir {
+// #define GEN_PASS_DECL_FINALIZEMEMREFTOLLVMCONVERSIONPASS
+// #include "mlir/Conversion/Passes.h.inc"
+// } // namespace mlir
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -1240,6 +1243,39 @@ public:
 
 struct CAtomicRMWOpLowering : public CLoadStoreOpLowering<memref::AtomicRMWOp> {
   using CLoadStoreOpLowering<memref::AtomicRMWOp>::CLoadStoreOpLowering;
+
+  /// Try to match the kind of a memref.atomic_rmw to determine whether to use a
+  /// lowering to llvm.atomicrmw or fallback to llvm.cmpxchg.
+  static std::optional<LLVM::AtomicBinOp>
+  matchSimpleAtomicOp(memref::AtomicRMWOp atomicOp) {
+    switch (atomicOp.getKind()) {
+    case arith::AtomicRMWKind::addf:
+      return LLVM::AtomicBinOp::fadd;
+    case arith::AtomicRMWKind::addi:
+      return LLVM::AtomicBinOp::add;
+    case arith::AtomicRMWKind::assign:
+      return LLVM::AtomicBinOp::xchg;
+    case arith::AtomicRMWKind::maximumf:
+      return LLVM::AtomicBinOp::fmax;
+    case arith::AtomicRMWKind::maxs:
+      return LLVM::AtomicBinOp::max;
+    case arith::AtomicRMWKind::maxu:
+      return LLVM::AtomicBinOp::umax;
+    case arith::AtomicRMWKind::minimumf:
+      return LLVM::AtomicBinOp::fmin;
+    case arith::AtomicRMWKind::mins:
+      return LLVM::AtomicBinOp::min;
+    case arith::AtomicRMWKind::minu:
+      return LLVM::AtomicBinOp::umin;
+    case arith::AtomicRMWKind::ori:
+      return LLVM::AtomicBinOp::_or;
+    case arith::AtomicRMWKind::andi:
+      return LLVM::AtomicBinOp::_and;
+    default:
+      return std::nullopt;
+    }
+    llvm_unreachable("Invalid AtomicRMWKind");
+  }
 
   LogicalResult
   matchAndRewrite(memref::AtomicRMWOp atomicOp, OpAdaptor adaptor,
@@ -2656,6 +2692,62 @@ public:
           callOp->getLoc(), newCallOp->getResult(0), index));
     }
     rewriter.replaceOp(callOp, results);
+    return success();
+  }
+};
+
+struct AllocaScopeOpLowering
+    : public ConvertOpToLLVMPattern<memref::AllocaScopeOp> {
+  using ConvertOpToLLVMPattern<memref::AllocaScopeOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::AllocaScopeOp allocaScopeOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    OpBuilder::InsertionGuard guard(rewriter);
+    Location loc = allocaScopeOp.getLoc();
+
+    // Split the current block before the AllocaScopeOp to create the inlining
+    // point.
+    auto *currentBlock = rewriter.getInsertionBlock();
+    auto *remainingOpsBlock =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    Block *continueBlock;
+    if (allocaScopeOp.getNumResults() == 0) {
+      continueBlock = remainingOpsBlock;
+    } else {
+      continueBlock = rewriter.createBlock(
+          remainingOpsBlock, allocaScopeOp.getResultTypes(),
+          SmallVector<Location>(allocaScopeOp->getNumResults(),
+                                allocaScopeOp.getLoc()));
+      rewriter.create<LLVM::BrOp>(loc, ValueRange(), remainingOpsBlock);
+    }
+
+    // Inline body region.
+    Block *beforeBody = &allocaScopeOp.getBodyRegion().front();
+    Block *afterBody = &allocaScopeOp.getBodyRegion().back();
+    rewriter.inlineRegionBefore(allocaScopeOp.getBodyRegion(), continueBlock);
+
+    // Save stack and then branch into the body of the region.
+    rewriter.setInsertionPointToEnd(currentBlock);
+    auto stackSaveOp =
+        rewriter.create<LLVM::StackSaveOp>(loc, getVoidPtrType());
+    rewriter.create<LLVM::BrOp>(loc, ValueRange(), beforeBody);
+
+    // Replace the alloca_scope return with a branch that jumps out of the body.
+    // Stack restore before leaving the body region.
+    rewriter.setInsertionPointToEnd(afterBody);
+    auto returnOp =
+        cast<memref::AllocaScopeReturnOp>(afterBody->getTerminator());
+    auto branchOp = rewriter.replaceOpWithNewOp<LLVM::BrOp>(
+        returnOp, returnOp.getResults(), continueBlock);
+
+    // Insert stack restore before jumping out the body of the region.
+    rewriter.setInsertionPoint(branchOp);
+    rewriter.create<LLVM::StackRestoreOp>(loc, stackSaveOp);
+
+    // Replace the op with values return from the body region.
+    rewriter.replaceOp(allocaScopeOp, continueBlock->getArguments());
+
     return success();
   }
 };
